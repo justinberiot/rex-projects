@@ -566,6 +566,10 @@ local ops = {}
 -- to run an op here.
 local REMOTE_ACTION = "projects_remote"
 
+-- remote_ctx is the ctx of the projects_remote call being answered, so that
+-- an op can reach the client that asked: the app, relaying for another host.
+local remote_ctx = nil
+
 function ops.project_rows() return project_rows() end
 
 -- ops.browse_start returns the folder the folder browser opens in.
@@ -637,6 +641,22 @@ function ops.remember(project, choice, dir, branch)
   load_state().last[project] = remembered
   save_state()
   return true
+end
+
+-- ops.show_session asks the app to switch to a session on this machine.
+-- When the action runs on another host, the app can't find this machine's
+-- session by its ID there, but the app's own connection here, which relays
+-- the call, can. It returns whether the app switched.
+function ops.show_session(session_id)
+  local client = remote_ctx and remote_ctx.client_id
+  if client == nil then return false end
+  local done = rex.call("client.perform", {
+    client_id = client,
+    action = "session.select",
+    args = { session_id = session_id },
+    timeout_ms = 5000,
+  })
+  return done ~= nil
 end
 
 function ops.saved_projects() return load_state().projects end
@@ -904,8 +924,16 @@ local function run(ctx)
   })
   if session == nil then error(failed, 0) end
 
-  -- Creating a session does not show it. Ask the app to switch to it.
-  rex.client.queue("session.select", { session_id = session.session_id })
+  -- Creating a session does not show it. Ask the app to switch to it. A
+  -- session on another host has to be shown from there.
+  if host.label == nil then
+    rex.client.queue("session.select", { session_id = session.session_id })
+  else
+    local asked, shown = pcall(host.call, "show_session", session.session_id)
+    if not (asked and shown) then
+      rex.log("warn", "new_project_session: could not switch to the new session on " .. host.name)
+    end
+  end
 end
 
 -- remove_run is the body of Remove Project from List….
@@ -961,11 +989,15 @@ rex.action{
   title = "Projects: Answer Another Machine",
   description = "Used by New Session in Project… on another machine to reach this one's projects; not for running by hand",
   category = "Projects",
-  run = function(_, args)
+  run = function(ctx, args)
     local fn = ops[args.op]
     if fn == nil then error(REMOTE_ACTION .. ": unknown operation " .. tostring(args.op), 0) end
     local list = args.args or {}
-    return { value = fn(unpack(list, 1, args.n or #list)) }
+    remote_ctx = ctx
+    local ok, value = pcall(fn, unpack(list, 1, args.n or #list))
+    remote_ctx = nil
+    if not ok then error(value, 0) end
+    return { value = value }
   end,
 }
 

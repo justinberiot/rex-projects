@@ -272,7 +272,7 @@ local function with_studio(fn)
       if method == "client.action" then
         assert(args.action == "projects_remote")
         local wire = json.decode(json.encode(args.args))
-        local result = actions.projects_remote.run({}, wire)
+        local result = actions.projects_remote.run({ client_id = "app-on-studio" }, wire)
         return { result = json.decode(json.encode(result)) }
       end
       return { session_id = "remote-s1" }
@@ -292,11 +292,18 @@ test("another host's projects are listed by host and open there", function()
     -- Each project twice, once for each host, then one add row each.
     assert(items[#items].title == "Add project on studio…", items[#items].title)
     assert(items[1].subtitle:find(" · ", 1, true), "host named: " .. items[1].subtitle)
-    assert(#calls == 0, "nothing made on this machine")
+    for _, c in ipairs(calls) do assert(c[1] ~= "session.create", "nothing made on this machine") end
     local create = remote_calls[#remote_calls]
-    assert(create[1] == "session.create", create[1])
+    local create
+    for _, c in ipairs(remote_calls) do if c[1] == "session.create" then create = c end end
+    assert(create, "session made on studio")
     assert(create[2].initial_windows[1].layout.options.cwd == tmp .. "/wt/my-app/feat-remote")
-    assert(queued[1][2].session_id == "remote-s1")
+    -- The switch goes through studio to the app's connection there: an ID from
+    -- studio means nothing to this machine's server.
+    assert(#queued == 0, "no session.select queued here")
+    local perform = calls[#calls]
+    assert(perform[1] == "client.perform" and perform[2].client_id == "app-on-studio", tostring(perform[1]))
+    assert(perform[2].args.session_id == "remote-s1")
   end)
 end)
 
