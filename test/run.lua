@@ -15,10 +15,11 @@ local json = {}
 function json.encode(v)
   local t = type(v)
   if t == "string" then return '"' .. v:gsub('[\\"]', "\\%0") .. '"' end
+  if v == nil then return "null" end
   if t ~= "table" then return tostring(v) end
   if #v > 0 or next(v) == nil then
     local parts = {}
-    for _, x in ipairs(v) do parts[#parts + 1] = json.encode(x) end
+    for i = 1, #v do parts[#parts + 1] = json.encode(v[i]) end
     return "[" .. table.concat(parts, ",") .. "]"
   end
   local parts = {}
@@ -59,6 +60,12 @@ function json.decode(s)
         if d == "}" then return obj end
       end
     end
+    for word, v in pairs({ ["true"] = true, ["false"] = false }) do
+      if s:sub(pos, pos + #word - 1) == word then pos = pos + #word; return v end
+    end
+    if s:sub(pos, pos + 3) == "null" then pos = pos + 4; return nil end
+    local num = s:match("^-?%d+%.?%d*", pos)
+    if num then pos = pos + #num; return tonumber(num) end
     error("bad json at " .. pos)
   end
   return value()
@@ -86,7 +93,12 @@ rex = {
       local a = table.remove(answers, 1)
       if a == nil then return nil, "cancelled" end
       if type(a) == "table" then return a end -- typed text, as allow_other gives
-      -- A string answer is matched against a row's title, "#n" by index.
+      -- A string answer is matched against a row's title or id; a function
+      -- answer picks the first row it accepts.
+      if type(a) == "function" then
+        for _, row in ipairs(spec.items) do if a(row) then return row.id end end
+        error("no matching row in " .. spec.title)
+      end
       for _, row in ipairs(spec.items) do
         if row.title == a or row.id == a then return row.id end
       end
@@ -155,7 +167,7 @@ test("add a project, then it is listed and persisted", function()
   assert(text:find("my-app", 1, true), "state file written: " .. text)
   I.reset()
   local rows = I.project_rows()
-  assert(rows[1].title == "my-app" and rows[#rows].title == "Add project…")
+  assert(rows[1].title == "my-app" and #rows == 1)
 end)
 
 test("a folder that is not a repository still starts a session", function()
@@ -241,9 +253,74 @@ test("cancelling at any step creates nothing", function()
   assert(#calls == 0)
 end)
 
-test("a session on another host is refused", function()
-  local ok = pcall(I.run, { server = "studio" })
-  assert(not ok)
+test("a session on another host still opens this machine's projects", function()
+  answers = { "my-app", "Current checkout" }
+  I.run({ server = "studio" })
+  assert(#calls == 1 and calls[1][2].initial_windows[1].layout.options.cwd == repo)
+end)
+
+-- Another host is a second copy of the script reached through rex.server.
+-- Here it loops back to this one's projects_remote action, through JSON as
+-- the real call goes, and records its own calls.
+local function with_studio(fn)
+  local remote_calls = {}
+  rex.servers = function() return { "studio" } end
+  rex.server = function(label)
+    assert(label == "studio")
+    return { call = function(method, args)
+      remote_calls[#remote_calls + 1] = { method, args }
+      if method == "client.action" then
+        assert(args.action == "projects_remote")
+        local wire = json.decode(json.encode(args.args))
+        local result = actions.projects_remote.run({}, wire)
+        return { result = json.decode(json.encode(result)) }
+      end
+      return { session_id = "remote-s1" }
+    end }
+  end
+  local ok, err = pcall(fn, remote_calls)
+  rex.servers, rex.server = nil, nil
+  if not ok then error(err, 0) end
+end
+
+test("another host's projects are listed by host and open there", function()
+  with_studio(function(remote_calls)
+    local on_studio = function(row) return row.title == "my-app" and row.subtitle:find("^studio · ") ~= nil end
+    answers = { on_studio, "New worktree…", "feat/remote", "main" }
+    I.run({})
+    local items = asked[1].items
+    -- Each project twice, once for each host, then one add row each.
+    assert(items[#items].title == "Add project on studio…", items[#items].title)
+    assert(items[1].subtitle:find(" · ", 1, true), "host named: " .. items[1].subtitle)
+    assert(#calls == 0, "nothing made on this machine")
+    local create = remote_calls[#remote_calls]
+    assert(create[1] == "session.create", create[1])
+    assert(create[2].initial_windows[1].layout.options.cwd == tmp .. "/wt/my-app/feat-remote")
+    assert(queued[1][2].session_id == "remote-s1")
+  end)
+end)
+
+test("a host that does not answer is left out", function()
+  rex.servers = function() return { "away" } end
+  rex.server = function() return { call = function() return nil, "unreachable" end } end
+  answers = { "my-app", "Current checkout" }
+  local ok, err = pcall(I.run, {})
+  rex.servers, rex.server = nil, nil
+  assert(ok, tostring(err))
+  assert(asked[1].items[#asked[1].items].title == "Add project…")
+  for _, row in ipairs(asked[1].items) do assert(not row.subtitle:find("away", 1, true)) end
+end)
+
+test("remove a project from another host", function()
+  with_studio(function()
+    local before = #I.load_state().projects
+    answers = { function(row) return row.title == "plain" and row.subtitle:find("^studio · ") ~= nil end }
+    I.remove_run()
+    assert(#asked[1].items == 2 * before, "each host's list: " .. #asked[1].items)
+  end)
+  I.reset()
+  for _, p in ipairs(I.load_state().projects) do assert(I.basename(p) ~= "plain", "forgotten through the other host") end
+  I.reset()
 end)
 
 test("a corrupt state file is an empty list", function()

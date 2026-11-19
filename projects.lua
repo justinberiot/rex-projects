@@ -8,6 +8,9 @@
 -- Then Rex opens a session in that folder. The last choice for each project
 -- is listed first next time.
 --
+-- Projects on other hosts the app is connected to are listed too, when those
+-- hosts run this script; their work is done there through projects_remote.
+--
 -- Install: put this file next to init.lua and add to init.lua
 --
 --     require("projects")
@@ -324,10 +327,8 @@ local function scan()
   return found
 end
 
--- project_rows returns the rows of the project picker: the added projects
--- and the scanned ones with the most recently used first, then the row that
--- adds a project.
-local ADD_PROJECT = "\0add"
+-- project_rows returns this machine's rows of the project picker: the added
+-- projects and the scanned ones, sorted by name.
 local function project_rows()
   local s = load_state()
   local seen, paths = {}, {}
@@ -344,7 +345,6 @@ local function project_rows()
   for _, p in ipairs(paths) do
     rows[#rows + 1] = { id = p, title = basename(p), subtitle = short(p), icon = "folder" }
   end
-  rows[#rows + 1] = { id = ADD_PROJECT, title = "Add project…", subtitle = "Choose a folder", icon = "plus" }
   return rows
 end
 
@@ -421,66 +421,6 @@ local function save_project(path)
   s.projects[#s.projects + 1] = path
   save_state()
   return path
-end
-
--- add_project is a folder browser in the palette. Each page lists the
--- folders inside one folder. Return on a repository adds it, and on any
--- other folder opens it. The first row adds the folder being browsed, so
--- a folder that is no repository can be a project too. Typing a path and
--- pressing Return on the last row jumps there, and a path that is a repository
--- is added. It returns the folder, or nil and why ("cancelled" when the
--- person gave up).
-local ADD_HERE = "\0here"
-local UP = "\0up"
-local function add_project()
-  local dir = config.roots[1] and expand(config.roots[1]) or env("REX_PROJECTS") and expand(env("REX_PROJECTS"))
-    or slashes(home)
-  if dir == "" or not is_folder(dir) then dir = "/" end
-  -- A folder tree is finite, but a typed path can loop; the cap keeps a
-  -- script from asking forever.
-  for _ = 1, 200 do
-    dir = dir:gsub("/+$", "")
-    if dir == "" then dir = "/" end
-    local rows = {
-      { id = ADD_HERE, title = "Add " .. (dir == "/" and "/" or basename(dir)), subtitle = short(dir), icon = "plus" },
-    }
-    if parent_of(dir) ~= nil then
-      rows[#rows + 1] = { id = UP, title = "..", subtitle = short(parent_of(dir)), icon = "folder" }
-    end
-    local children = {}
-    for _, child in ipairs(subfolders(dir)) do
-      children[child.path] = child
-      rows[#rows + 1] = {
-        id = child.path,
-        title = basename(child.path),
-        icon = "folder",
-      }
-    end
-    local picked, why = rex.ui.pick{
-      title = "Add project",
-      placeholder = short(dir) .. "/  (type a path to jump)",
-      allow_other = true,
-      items = rows,
-    }
-    if picked == nil then return nil, why end
-    if type(picked) == "table" then
-      -- The person typed a path instead of choosing a row.
-      local typed = expand(picked.text or "")
-      if typed == "" then return nil, "cancelled" end
-      if not is_folder(typed) then return nil, "not a folder: " .. typed end
-      if is_repo_root(typed) then return save_project(typed) end
-      dir = typed
-    elseif picked == ADD_HERE then
-      return save_project(dir)
-    elseif picked == UP then
-      dir = parent_of(dir)
-    elseif children[picked] and children[picked].repo then
-      return save_project(picked)
-    else
-      dir = picked
-    end
-  end
-  return nil, "too many steps"
 end
 
 ---------------------------------------------------------------------------
@@ -613,6 +553,175 @@ local function add_worktree(project, branch, base)
 end
 
 ---------------------------------------------------------------------------
+-- Operations: the work done on the machine that holds the projects
+---------------------------------------------------------------------------
+
+-- ops is everything the action does to a machine's files: git, folders and
+-- the saved list. The action calls them directly for this machine, and
+-- through the projects_remote action for another host. So each one takes and
+-- returns plain data that survives JSON, and returns one value.
+local ops = {}
+
+-- REMOTE_ACTION is the action another machine's copy of this script calls
+-- to run an op here.
+local REMOTE_ACTION = "projects_remote"
+
+function ops.project_rows() return project_rows() end
+
+-- ops.browse_start returns the folder the folder browser opens in.
+function ops.browse_start()
+  local dir = config.roots[1] and expand(config.roots[1])
+    or env("REX_PROJECTS") and expand(env("REX_PROJECTS"))
+    or slashes(home)
+  if dir == "" or not is_folder(dir) then dir = "/" end
+  return dir
+end
+
+-- ops.browse_page describes one page of the folder browser: the folder, its
+-- parent, and the folders inside it.
+function ops.browse_page(dir)
+  dir = dir:gsub("/+$", "")
+  if dir == "" then dir = "/" end
+  local parent = parent_of(dir)
+  return {
+    dir = dir,
+    name = dir == "/" and "/" or basename(dir),
+    short = short(dir),
+    parent = parent,
+    parent_short = parent and short(parent),
+    children = subfolders(dir),
+  }
+end
+
+-- ops.resolve reads a path typed into the browser: where it points, and
+-- whether that is a folder and a repository.
+function ops.resolve(text)
+  local path = expand(text or "")
+  if path == "" then return { path = "" } end
+  local folder = is_folder(path)
+  return { path = path, folder = folder, repo = folder and is_repo_root(path) }
+end
+
+function ops.save_project(path) return save_project(path) end
+
+function ops.checkout_rows(project)
+  local rows, trees = checkout_rows(project)
+  return { rows = rows, trees = trees }
+end
+
+function ops.valid_branch_name(project, name) return valid_branch_name(project, name) end
+
+function ops.branch_exists(project, branch)
+  return git(project, "rev-parse", "--verify", "--quiet", "refs/heads/" .. branch) ~= nil
+end
+
+function ops.base_rows(project) return base_rows(project) end
+
+function ops.add_worktree(project, branch, base)
+  local dir, err = add_worktree(project, branch, base)
+  return { dir = dir, err = err }
+end
+
+-- ops.remember saves where a project was last opened. A new worktree is
+-- remembered as that worktree. Git may spell the folder differently from the
+-- path made here (a symlink such as /tmp), and the picker's rows use git's
+-- spelling, so the new worktree is looked up by its branch.
+function ops.remember(project, choice, dir, branch)
+  local remembered = choice
+  if choice == NEW_WORKTREE then
+    remembered = dir
+    for _, tree in ipairs(worktrees(project) or {}) do
+      if branch ~= nil and tree.branch == branch then remembered = tree.path end
+    end
+  end
+  load_state().last[project] = remembered
+  save_state()
+  return true
+end
+
+function ops.saved_projects() return load_state().projects end
+
+function ops.forget(project)
+  local s = load_state()
+  for i, p in ipairs(s.projects) do
+    if p == project then table.remove(s.projects, i); break end
+  end
+  s.last[project] = nil
+  save_state()
+  return true
+end
+
+---------------------------------------------------------------------------
+-- Hosts: this machine and the other Rex servers the app is connected to
+---------------------------------------------------------------------------
+
+-- this_name is what this machine is called next to other hosts' projects:
+-- its host name without the domain.
+local this_name_cache = nil
+local function this_name()
+  if this_name_cache ~= nil then return this_name_cache end
+  local name = env("COMPUTERNAME")
+  if name == nil then
+    local r = rex.exec({ "uname", "-n" })
+    name = r ~= nil and r.ok and trim(r.stdout) or ""
+  end
+  name = name:match("^[^.]*") or ""
+  this_name_cache = name ~= "" and name or "this machine"
+  return this_name_cache
+end
+
+-- A host is where projects live. host.call(op, ...) runs an op there and
+-- returns its result; host.create_session makes a session there. label is
+-- nil for this machine and the server's label for another host.
+local function this_host()
+  return {
+    label = nil,
+    name = this_name(),
+    call = function(op, ...) return ops[op](...) end,
+    create_session = function(spec) return rex.call("session.create", spec) end,
+  }
+end
+
+local function other_host(label)
+  local server = rex.server(label)
+  return {
+    label = label,
+    name = label,
+    call = function(op, ...)
+      local res, err = server.call("client.action", {
+        action = REMOTE_ACTION,
+        args = { op = op, args = { ... }, n = select("#", ...) },
+      })
+      if res == nil then error(label .. ": " .. tostring(err), 0) end
+      return res.result ~= nil and res.result.value or nil
+    end,
+    create_session = function(spec) return server.call("session.create", spec) end,
+  }
+end
+
+-- reachable_hosts returns this machine and every other host the app is
+-- connected to that runs this script, each with what first(host) returned.
+-- A host that is away, or has no copy of the script, is left out.
+local function reachable_hosts(first)
+  local found = {}
+  local candidates = { this_host() }
+  local ok, labels = pcall(function() return rex.servers and rex.servers() or {} end)
+  for _, label in ipairs(ok and labels or {}) do
+    local made, host = pcall(other_host, label)
+    if made then candidates[#candidates + 1] = host end
+  end
+  for _, host in ipairs(candidates) do
+    local answered, value = pcall(first, host)
+    if answered then
+      found[#found + 1] = { host = host, value = value }
+    else
+      rex.log("info", "projects: leaving out " .. host.name .. ": " .. tostring(value))
+    end
+  end
+  return found
+end
+
+---------------------------------------------------------------------------
 -- The action
 ---------------------------------------------------------------------------
 
@@ -621,45 +730,132 @@ local function fail(message)
   error("new_project_session: " .. tostring(message), 0)
 end
 
--- run is the body of New Session in Project…
-local function run(ctx)
-  -- The projects are on this server's machine. A session on another host
-  -- would start in a folder that may not exist there.
-  if ctx ~= nil and ctx.server ~= nil then
-    fail("the session is on " .. ctx.server .. ", and the projects are here")
+-- add_project is a folder browser in the palette, over the folders of host.
+-- Each page lists the folders inside one folder. Return on a repository adds
+-- it, and on any other folder opens it. The first row adds the folder being
+-- browsed, so a folder that is no repository can be a project too. Typing a
+-- path and pressing Return on the last row jumps there, and a path that is a
+-- repository is added. It returns the folder, or nil and why ("cancelled"
+-- when the person gave up).
+local ADD_HERE = "\0here"
+local UP = "\0up"
+local function add_project(host)
+  local dir = host.call("browse_start")
+  -- A folder tree is finite, but a typed path can loop; the cap keeps a
+  -- script from asking forever.
+  for _ = 1, 200 do
+    local page = host.call("browse_page", dir)
+    dir = page.dir
+    local rows = {
+      { id = ADD_HERE, title = "Add " .. page.name, subtitle = page.short, icon = "plus" },
+    }
+    if page.parent ~= nil then
+      rows[#rows + 1] = { id = UP, title = "..", subtitle = page.parent_short, icon = "folder" }
+    end
+    local children = {}
+    for _, child in ipairs(page.children or {}) do
+      children[child.path] = child
+      rows[#rows + 1] = { id = child.path, title = basename(child.path), icon = "folder" }
+    end
+    local picked, why = rex.ui.pick{
+      title = host.label and ("Add project on " .. host.name) or "Add project",
+      placeholder = page.short .. "/  (type a path to jump)",
+      allow_other = true,
+      items = rows,
+    }
+    if picked == nil then return nil, why end
+    if type(picked) == "table" then
+      -- The person typed a path instead of choosing a row.
+      local typed = host.call("resolve", picked.text or "")
+      if typed.path == "" then return nil, "cancelled" end
+      if not typed.folder then return nil, "not a folder: " .. typed.path end
+      if typed.repo then return host.call("save_project", typed.path) end
+      dir = typed.path
+    elseif picked == ADD_HERE then
+      return host.call("save_project", dir)
+    elseif picked == UP then
+      dir = page.parent
+    elseif children[picked] and children[picked].repo then
+      return host.call("save_project", picked)
+    else
+      dir = picked
+    end
   end
+  return nil, "too many steps"
+end
+
+-- pick_project asks for a project among every host's, or for a new one. It
+-- returns the host and the project's folder, or nil and why.
+local ADD_PROJECT = "\0add"
+local function pick_project()
+  local listed = reachable_hosts(function(host) return host.call("project_rows") end)
+  local several = #listed > 1
+  local items, chosen = {}, {}
+  for _, entry in ipairs(listed) do
+    for _, row in ipairs(entry.value or {}) do
+      local id = entry.host.label and (entry.host.label .. "\0" .. row.id) or row.id
+      chosen[id] = { host = entry.host, project = row.id }
+      items[#items + 1] = {
+        id = id,
+        title = row.title,
+        subtitle = several and (entry.host.name .. " · " .. row.subtitle) or row.subtitle,
+        icon = row.icon,
+      }
+    end
+  end
+  for i, entry in ipairs(listed) do
+    local id = ADD_PROJECT .. tostring(i)
+    chosen[id] = { host = entry.host, add = true }
+    items[#items + 1] = {
+      id = id,
+      title = several and ("Add project on " .. entry.host.name .. "…") or "Add project…",
+      subtitle = "Choose a folder",
+      icon = "plus",
+    }
+  end
+  local picked, why = rex.ui.pick{
+    title = "New session",
+    placeholder = "Choose a project",
+    items = items,
+  }
+  if picked == nil then return nil, why end
+  local choice = chosen[picked]
+  if choice.add then
+    local project
+    project, why = add_project(choice.host)
+    if project == nil then return nil, why end
+    return choice.host, project
+  end
+  return choice.host, choice.project
+end
+
+-- run is the body of New Session in Project… The projects can be on this
+-- machine or on any other host the app is connected to that runs this
+-- script; the session starts on the host the project is on.
+local function run(ctx)
   -- stop ends the action. A person who cancels is not worth a log line.
   local function stop(why)
     if why ~= "cancelled" then rex.log("warn", "new_project_session: " .. tostring(why)) end
   end
 
   -- 1. The project.
-  local project, why = rex.ui.pick{
-    title = "New session",
-    placeholder = "Choose a project",
-    items = project_rows(),
-  }
-  if project == nil then return stop(why) end
-  if project == ADD_PROJECT then
-    project, why = add_project()
-    if project == nil then return stop(why) end
-  end
+  local host, project = pick_project()
+  if host == nil then return stop(project) end
   local name = basename(project)
 
   -- 2. The checkout.
-  local rows, trees = checkout_rows(project)
-  local choice
-  choice, why = rex.ui.pick{
+  local listing = host.call("checkout_rows", project)
+  local trees = listing.trees
+  local choice, why = rex.ui.pick{
     title = name,
     placeholder = "Choose where to work",
-    items = rows,
+    items = listing.rows,
   }
   if choice == nil then return stop(why) end
 
-  local dir, label = project, name
+  local dir, label, branch = project, name, nil
   if choice == NEW_WORKTREE then
     -- 3. The branch, then what it starts from.
-    local branch
     branch, why = rex.ui.input{
       title = "New worktree in " .. name,
       placeholder = "Branch name",
@@ -668,22 +864,22 @@ local function run(ctx)
     if branch == nil then return stop(why) end
     branch = trim(branch)
     if branch == "" then return end
-    if not valid_branch_name(project, branch) then
+    if not host.call("valid_branch_name", project, branch) then
       return stop("not a valid branch name: " .. branch)
     end
     -- An existing branch needs no base.
     local base
-    if git(project, "rev-parse", "--verify", "--quiet", "refs/heads/" .. branch) == nil then
+    if not host.call("branch_exists", project, branch) then
       base, why = rex.ui.pick{
         title = "Start " .. branch .. " from",
         placeholder = "Choose a base",
-        items = base_rows(project),
+        items = host.call("base_rows", project),
       }
       if base == nil then return stop(why) end
     end
-    local err
-    dir, err = add_worktree(project, branch, base)
-    if dir == nil then fail(err) end
+    local made = host.call("add_worktree", project, branch, base)
+    if made.dir == nil then fail(made.err) end
+    dir = made.dir
     label = name .. " · " .. branch
   elseif choice ~= CURRENT then
     dir = choice
@@ -694,24 +890,9 @@ local function run(ctx)
     end
   end
 
-  -- Remember the choice. A new worktree is remembered as that worktree.
-  -- Git may spell the folder differently from the path made here (a symlink
-  -- such as /tmp), and the picker's rows use git's spelling, so look the new
-  -- worktree up by its branch.
-  local remembered = choice
-  if choice == NEW_WORKTREE then
-    remembered = dir
-    for _, tree in ipairs(worktrees(project) or {}) do
-      if tree.branch ~= nil and label == name .. " · " .. tree.branch then
-        remembered = tree.path
-      end
-    end
-  end
-  load_state().last[project] = remembered
-  save_state()
+  host.call("remember", project, choice, dir, branch)
 
-  -- A window in the API is a tab in the app.
-  local session, failed = rex.call("session.create", {
+  local session, failed = host.create_session({
     label = label,
     initial_windows = { {
       window_label = "shell",
@@ -729,23 +910,30 @@ end
 
 -- remove_run is the body of Remove Project from List….
 local function remove_run()
-  local s = load_state()
-  if #s.projects == 0 then return end
-  local items = {}
-  for _, p in ipairs(s.projects) do
-    items[#items + 1] = { id = p, title = basename(p), subtitle = short(p), icon = "folder" }
+  local listed = reachable_hosts(function(host) return host.call("saved_projects") end)
+  local several = #listed > 1
+  local items, chosen = {}, {}
+  for _, entry in ipairs(listed) do
+    for _, p in ipairs(entry.value or {}) do
+      local id = entry.host.label and (entry.host.label .. "\0" .. p) or p
+      chosen[id] = { host = entry.host, project = p }
+      items[#items + 1] = {
+        id = id,
+        title = basename(p),
+        -- short knows only this machine's home folder.
+        subtitle = several and (entry.host.name .. " · " .. (entry.host.label and p or short(p))) or short(p),
+        icon = "folder",
+      }
+    end
   end
-  local project = rex.ui.pick{
+  if #items == 0 then return end
+  local picked = rex.ui.pick{
     title = "Remove project",
     placeholder = "Choose a project to forget (its folder stays)",
     items = items,
   }
-  if project == nil then return end
-  for i, p in ipairs(s.projects) do
-    if p == project then table.remove(s.projects, i); break end
-  end
-  s.last[project] = nil
-  save_state()
+  if picked == nil then return end
+  chosen[picked].host.call("forget", chosen[picked].project)
 end
 
 rex.action{
@@ -764,6 +952,21 @@ rex.action{
   category = "Projects",
   keywords = "forget delete project list",
   run = remove_run,
+}
+
+-- projects_remote runs one op for New Session in Project… on another
+-- machine, which reaches this one with rex.server(label).call.
+rex.action{
+  name = REMOTE_ACTION,
+  title = "Projects: Answer Another Machine",
+  description = "Used by New Session in Project… on another machine to reach this one's projects; not for running by hand",
+  category = "Projects",
+  run = function(_, args)
+    local fn = ops[args.op]
+    if fn == nil then error(REMOTE_ACTION .. ": unknown operation " .. tostring(args.op), 0) end
+    local list = args.args or {}
+    return { value = fn(unpack(list, 1, args.n or #list)) }
+  end,
 }
 
 ---------------------------------------------------------------------------
@@ -802,6 +1005,7 @@ M._internal = {
   checkout_rows = checkout_rows, base_rows = base_rows, add_worktree = add_worktree,
   project_rows = project_rows, valid_branch_name = valid_branch_name,
   run = run, config = config, subfolders = subfolders, parent_of = parent_of, is_folder = is_folder,
+  ops = ops, remove_run = remove_run,
   reset = function() state = nil end,
 }
 

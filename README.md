@@ -6,7 +6,22 @@ A [Rex](https://www.superlogical.com/rex) Lua script that adds **New Session in 
 2. **Pick where to work:** the current checkout, a worktree the project already has, or **New worktree…**. The choice you made last for a project is listed first next time.
 3. For a new worktree, **name the branch**, then **pick what it starts from** (the current branch, the remote's default branch, or any local branch). An existing branch skips that last prompt.
 
-Rex then opens a session in that folder. **Remove Project from List…** forgets a project without touching its folder.
+Rex then opens a session in that folder, on the machine the project is on.
+
+## Projects on several machines
+
+Put the same `projects.lua` in the config of every machine you work on: say a Mac and a Linux server. The picker then lists the projects of every machine the app is connected to, each marked with its machine:
+
+```
+my-app     macbook · ~/Code/my-app
+lagotta    vps · ~/src/lagotta/lagotta
+Add project on macbook…
+Add project on vps…
+```
+
+The action runs on the server whose shortcuts the app follows (`rex home`). It reaches the others with `rex.server(label)`, calling their `projects_remote` action, so their git, folders and project list stay on their side. A worktree is made there and the session starts there. A machine that is away, or has no copy of the script, is left out of the list. Every machine keeps its own project list and its own settings.
+
+`projects_remote` shows up in the command palette as **Projects: Answer Another Machine**; it is only for the other copies to call. **Remove Project from List…** forgets a project without touching its folder.
 
 ## Install
 
@@ -50,7 +65,7 @@ The project list and each project's last choice are kept in `projects.json` unde
 ## What it needs
 
 - Git 2.x on the server's `PATH`. A folder that is not a repository still works, as a plain folder.
-- The projects live on the machine that runs the Rex server. A session on another host is refused.
+- Projects are found on the machine that runs the Rex server and on every other host the app is connected to that runs this script too.
 - Everything runs through `rex.exec` with argument lists, never a shell, so paths with spaces or quotes are safe.
 
 Tested on macOS with Git 2.54. Windows and Linux code paths (`cmd`, `dir`, `%APPDATA%`) follow the same logic but have not been run.
