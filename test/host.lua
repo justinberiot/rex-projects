@@ -24,6 +24,29 @@ local rows = I.checkout_rows(dir .. "/repo")
 assert(rows[1].title == "Current checkout" and #rows == 3, "rows: " .. #rows)
 assert(#I.subfolders(dir) >= 2)
 assert(I.base_rows(dir .. "/repo")[1].id == "main")
+
+-- A bare repository in project/.bare, with project/.git pointing at it and
+-- every checkout beside it.
+local bare = dir .. "/layout"
+run("git", "clone", "-q", "--bare", dir .. "/repo", bare .. "/.bare")
+local gitfile = io.open(bare .. "/.git", "w"); gitfile:write("gitdir: .bare\n"); gitfile:close()
+run("git", "-C", bare, "worktree", "add", "-q", bare .. "/main", "main")
+local bt = I.add_worktree(bare, "feat/y", "main")
+assert(bt == bare .. "/feat-y", "bare-layout worktree folder: " .. tostring(bt))
+-- From a worktree of the layout, new worktrees still go beside the others.
+local bt2 = I.add_worktree(bare .. "/main", "feat/z", "main")
+assert(bt2 == bare .. "/feat-z", "bare-layout worktree from a worktree: " .. tostring(bt2))
+local brows = I.checkout_rows(bare)
+assert(brows[1].id ~= "\0current", "no current row for a bare project")
+assert(#brows == 4, "new + main + feat/y + feat/z, got " .. #brows)
+for _, row in ipairs(brows) do
+  assert(row.id ~= bare .. "/.bare", "the bare repository is not a checkout")
+end
+assert(I.base_rows(bare)[1].subtitle == "default branch")
+-- From the main worktree: CURRENT, new, and the two others, not main twice.
+local mrows = I.checkout_rows(bare .. "/main")
+assert(mrows[1].title == "Current checkout" and #mrows == 4, "worktree rows: " .. #mrows)
+
 I.load_state().projects[1] = dir .. "/repo"; I.save_state(); I.reset()
 assert(I.load_state().projects[1] == dir .. "/repo", "state round trip")
 run("rm", "-rf", dir)

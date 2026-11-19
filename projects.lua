@@ -16,7 +16,10 @@
 --
 --     require("projects").setup{
 --       key       = "alt+cmd+n",        -- false to bind nothing
---       worktrees = "~/.rex/worktrees", -- where new worktrees are made
+--       worktrees = "~/.rex/worktrees", -- where new worktrees are made,
+--                                       -- except in a bare-repository
+--                                       -- layout (project/.bare), where
+--                                       -- they go beside the others
 --       roots     = { "~/Code" },       -- folders whose repositories are
 --                                       -- listed without being added
 --     }
@@ -247,6 +250,7 @@ local function worktrees(project)
       list[#list + 1] = {
         path = slashes(path),
         branch = entry:match("\nbranch refs/heads/([^\n]+)"),
+        bare = entry:find("\nbare", 1, true) ~= nil,
         prunable = entry:find("\nprunable", 1, true) ~= nil,
       }
     end
@@ -488,6 +492,34 @@ end
 local NEW_WORKTREE = "\0new"
 local CURRENT = "\0current"
 
+-- is_bare says whether dir is itself a bare repository: no files checked out,
+-- only worktrees. The folder holding a .git file that points at a .bare
+-- repository counts, because git opens the bare repository from there.
+local function is_bare(dir)
+  local out = git(dir, "rev-parse", "--is-bare-repository")
+  return out ~= nil and trim(out) == "true"
+end
+
+-- bare_layout_root returns the folder that holds a repository's worktrees
+-- side by side, or nil when the repository is not laid out that way. The
+-- layout is a bare repository in a hidden folder (.bare, .git) with every
+-- checkout beside it:
+--
+--     project/.bare  project/.git -> .bare  project/main  project/feature
+--
+-- It is found from the project folder or from any of its worktrees.
+local function bare_layout_root(project)
+  local bare = git(project, "config", "--bool", "core.bare")
+  if bare == nil or trim(bare) ~= "true" then return nil end
+  local common = git(project, "rev-parse", "--path-format=absolute", "--git-common-dir")
+  if common == nil then return nil end
+  common = slashes(trim(common)):gsub("/+$", "")
+  -- A bare repository that is not hidden (project.git) sits among other
+  -- folders; making worktrees beside it would scatter them.
+  if basename(common):sub(1, 1) ~= "." then return nil end
+  return parent_of(common)
+end
+
 -- checkout_rows returns the rows of the checkout picker, with the one that
 -- was used last for project first. Its second result is the project's list of
 -- worktrees, nil for a folder with no repository.
@@ -498,17 +530,28 @@ local function checkout_rows(project)
     rows[1] = { id = CURRENT, title = "Current folder", subtitle = short(project), icon = "folder" }
     return rows, nil
   end
-  local branch = current_branch(project)
-  rows[#rows + 1] = {
-    id = CURRENT,
-    title = "Current checkout",
-    subtitle = (branch or "detached HEAD") .. " · " .. short(project),
-    icon = "folder",
-  }
+  -- A bare repository has no files of its own to work in, so it gets no
+  -- CURRENT row; its worktrees are the only checkouts.
+  local top = nil
+  if not is_bare(project) then
+    local branch = current_branch(project)
+    rows[#rows + 1] = {
+      id = CURRENT,
+      title = "Current checkout",
+      subtitle = (branch or "detached HEAD") .. " · " .. short(project),
+      icon = "folder",
+    }
+    -- Git's spelling of the project's folder, to leave it out of the list
+    -- below: CURRENT already names it.
+    local out = git(project, "rev-parse", "--show-toplevel")
+    if out ~= nil then top = slashes(trim(out)) end
+  end
   rows[#rows + 1] = { id = NEW_WORKTREE, title = "New worktree…", icon = "plus" }
   for i, tree in ipairs(trees) do
-    -- The first entry is the checkout that CURRENT already names.
-    if i > 1 and not tree.prunable then
+    -- Without a top folder, fall back to the first entry being the
+    -- checkout that CURRENT names.
+    local is_current = (top ~= nil and tree.path == top) or (top == nil and i == 1 and rows[1].id == CURRENT)
+    if not is_current and not tree.bare and not tree.prunable then
       rows[#rows + 1] = {
         id = tree.path,
         title = tree.branch or basename(tree.path),
@@ -540,7 +583,9 @@ local function base_rows(project)
     end
   end
   local branch = current_branch(project)
-  if branch then add(branch, branch, "current branch") else add("HEAD", "HEAD", "detached") end
+  -- A bare repository's HEAD is its default branch, not one being worked on.
+  local label = is_bare(project) and "default branch" or "current branch"
+  if branch then add(branch, branch, label) else add("HEAD", "HEAD", "detached") end
   -- origin's default branch, so a worktree can start from the remote's
   -- latest instead of a stale local branch.
   add(remote_default(project), nil, "remote default")
@@ -553,7 +598,9 @@ end
 local function add_worktree(project, branch, base)
   -- A branch name may hold slashes; a folder name may not.
   local folder = branch:gsub("[/\\:]", "-")
-  local dir = worktrees_dir() .. "/" .. basename(project) .. "/" .. folder
+  local root = bare_layout_root(project)
+  local dir = root and (root .. "/" .. folder)
+    or (worktrees_dir() .. "/" .. basename(project) .. "/" .. folder)
   local exists = git(project, "rev-parse", "--verify", "--quiet", "refs/heads/" .. branch)
   local _, err
   if exists then

@@ -30,6 +30,19 @@ require("projects").setup{
 }
 ```
 
+### Bare-repository layouts
+
+A project kept as a bare repository with its checkouts beside it is detected and kept that way:
+
+```
+project/.bare        the repository
+project/.git         "gitdir: .bare"
+project/main         a worktree
+project/feature-x    a worktree
+```
+
+New worktrees go in `project/<branch>` instead of the `worktrees` folder, whether you added `project` or one of its worktrees. The project folder itself has no files to work in, so it offers only its worktrees and **New worktree…**. Git's `worktree.useRelativePaths` setting is respected.
+
 `REX_WORKTREES` and `REX_PROJECTS` set the worktree folder and one scan root when `setup` doesn't.
 
 The project list and each project's last choice are kept in `projects.json` under your config folder (`$XDG_CONFIG_HOME/rex`, `~/.config/rex`, or `%APPDATA%\rex` on Windows).
